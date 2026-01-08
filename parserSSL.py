@@ -1,392 +1,345 @@
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-testssl_problems_only.py
-Reads a folder of testssl JSON files and prints a compact "problems-only" summary.
-- ANSI colours on by default (disable with --no-color)
-- Includes deprecated protocols (TLS1.0/1.1), weak ciphers (RC4/3DES/CBC), weak DH,
-  certificate near-expiry + broken trust, and known vulnerabilities.
-- Prints ip, domain, rdns, and port for each affected host.
-
-Notes:
-- Designed to be resilient to wording differences across testssl versions.
-- We look for IDs and key substrings in `id` or `finding` fields rather than exact phrases.
-"""
-
-from __future__ import annotations
-import argparse
-import json
 import os
-import re
-import sys
+import glob
+import json
+from typing import Dict, List, Optional, Tuple, Union
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
 
-# ---------------- ANSI helpers ----------------
-class Ansi:
-    RED = "\x1b[31m"
-    YELLOW = "\x1b[33m"
-    CYAN = "\x1b[36m"
-    BOLD = "\x1b[1m"
-    DIM = "\x1b[2m"
-    RESET = "\x1b[0m"
+# -- Dictionary of List initialisation
 
-def colorize(enabled: bool, text: str, col: str) -> str:
-    return f"{col}{text}{Ansi.RESET}" if enabled else text
+def initialise_sructure():
+    results = {
+        "host": [],
+        "outdated_protocols": [],
+        "outdated_ciphers": [],
+        "wildcard": [],
+        "chain_of_trust": [],
+        "vulnerability": [],
+        "days": [],
+        "problem": [],
+        "fingerprint": []
+    }
+    return results
 
-# ---------------- Parsing helpers ----------------
-VULN_IDS = {
-    # Common testssl vulnerability IDs (case-insensitive match; we'll substring-match)
-    "HEARTBLEED", "ROBOT", "POODLE", "SWEET32", "FREAK", "DROWN",
-    "LOGJAM", "BEAST", "CRIME", "BREACH", "CCS", "TICKETBLEED",
-    "WINSHOCK", "LUCKY13"
-}
 
-RE_DAYS = re.compile(r"(\d+)\s*day", re.IGNORECASE)
+def get_host(id_: str, finding: str, results):
+    if id_.startswith("service"):
+        results["host"].append(finding)
+    return results
 
-def parse_ip_and_domain(ip_field: str) -> Tuple[Optional[str], Optional[str]]:
+def get_outdated_protocol(id_: str, finding: str, results):
+    outdated_protocol = ["SSLv2", "SSLv3", "TLS1", "TLS1_1"]
+    if id_ in outdated_protocol and "offered (" in finding["finding"]:
+        results["outdated_protocols"].append(finding)
+    return results
+
+def get_ciphers(id_:str, finding:str, results):
+    ciphers_terms = ["CBC", "RC4", "3DES"]
+    if id_.startswith("cipher-") and any(term in finding["finding"] for term in ciphers_terms):
+        results["outdated_ciphers"].append(finding)
+    return results
+
+def wildcard_issue(id_: str, finding: str, results):
+    if "cert_commonName" == id_ and finding["finding"].startswith("*"):
+        results["wildcard"].append(finding)
+    return results
+
+def chain_of_trust(id_: str, finding: str, results):
+    if id_.startswith("cert_chain_of_trust") and finding["severity"] != "OK":
+        results["chain_of_trust"].append(finding)
+    return results
+
+def get_expiration_date(id_: str, finding: str, results):
+    if len(results["days"]) == 0:
+        if id_.startswith("cert_expirationStatus"):
+            results["days"].append(finding)
+        return results
+
+def get_vunerability(id_: str, finding: str, results):
+
+    if "cve" in finding and finding["severity"] not in {"OK", "INFO"}:
+        results["vulnerability"].append(finding)
+    return results
+
+def get_problem(id_: str, finding: str, results):
+    if id_ == "scanProblem" :
+        results["problem"].append(finding)
+    return results
+
+def get_fingerpint(id_: str, finding: str, results):
+    if id_.startswith("cert_fingerprintSHA256"):
+        results["fingerprint"].append(finding)
+    return results
+
+def extract_information(id_: str, f: str, results):
+    get_host(id_, f, results)
+    get_outdated_protocol(id_, f, results)
+    get_ciphers(id_, f, results)
+    wildcard_issue(id_, f, results)
+    chain_of_trust(id_, f, results)
+    get_expiration_date(id_, f, results)
+    get_vunerability(id_, f, results)
+    get_problem(id_, f, results)
+    get_fingerpint(id_, f, results)
+
+    return results
+
+"""
+UNDERSTAND THE FINGERPRINTS ON CERT. WHY DO I HAVE 4? SAME FINGERS == SAME CERT // ONE ISSUE PRINT
+These are actually two. #cert1 and #cert 2 are not refererring to the diif cert. Check ip and sha256
+"""
+
+
+def check_fingerptints(results):
     """
-    testssl often encodes as 'hostname/IP'. We try to split that.
-    Returns (domain, ip). Either may be None if not present/parsable.
+    Group hosts that share the same SHA256 fingerprint set.
+    Returns: signature_to_hosts dict[tuple[fps], list[ip_field]]
     """
-    if not ip_field:
-        return (None, None)
-    if "/" in ip_field:
-        left, right = ip_field.split("/", 1)
-        # Heuristic: left is usually DNS name, right is IP
-        domain = left.strip() or None
-        ip = right.strip() or None
-        return (domain, ip)
-    # Otherwise we just have an IP or a host name
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip_field) or ":" in ip_field:
-        return (None, ip_field.strip())
-    return (ip_field.strip(), None)
+    hosts = results.get("host", [])
+    fps = results.get("fingerprint", [])
 
-def looks_offered(text: str) -> bool:
-    """Return True if a finding suggests 'offered' (and not 'not offered')."""
-    t = text.lower()
-    return ("offered" in t or "supported" in t) and ("not offered" not in t and "is not offered" not in t and "not supported" not in t)
+    # host_ip_field -> set of sha256 fingerprints
+    host_to_fps = defaultdict(set)
 
-def looks_not_offered(text: str) -> bool:
-    t = text.lower()
-    return ("not offered" in t) or ("is not offered" in t) or ("not supported" in t)
+    # collect ip fields from service entries
+    host_ip_fields = []
+    for h in hosts:
+        if isinstance(h, dict):
+            ip_field = (h.get("ip") or "").strip()
+            if ip_field:
+                host_ip_fields.append(ip_field)
 
-def finding_mentions(text: str, *words: str) -> bool:
-    t = text.upper()
-    return all(w.upper() in t for w in words)
+    # map fingerprints to their host via same ip_field
+    for fp in fps:
+        if not isinstance(fp, dict):
+            continue
+        fp_ip_field = (fp.get("ip") or "").strip()
+        fp_value = (fp.get("finding") or "").strip()
+        if fp_ip_field and fp_value:
+            host_to_fps[fp_ip_field].add(fp_value)
 
-def extract_cn_and_wildcard(finding: str) -> Tuple[Optional[str], Optional[bool]]:
+    # group hosts by fingerprint signature
+    signature_to_hosts = defaultdict(list)
+    for ip_field in host_ip_fields:
+        signature = tuple(sorted(host_to_fps.get(ip_field, set())))
+        signature_to_hosts[signature].append(ip_field)
+
+    # print fingerprint grouping (test output)
+    for signature, grouped_hosts in signature_to_hosts.items():
+        if not signature:
+            print(f"[WARN] No fingerprints found for: {grouped_hosts}")
+            continue
+
+        if len(grouped_hosts) > 1:
+            #print(f"[OK] Same fingerprints for ALL these hosts ({len(grouped_hosts)}):")
+            for h in grouped_hosts:
+                #print("   -", h)
+                continue
+        else:
+            print(f"[INFO] Fingerprints only for host: {grouped_hosts[0]}")
+
+    return signature_to_hosts
+
+
+def _unique_keep_order(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def check_issues(results):
+
+    # Check the sanity of the file
+    if len(results["problem"]) == 0:
+
+        # --- MULTI HOST CASE (same domain, multiple IPs) ---
+        if len(results["host"]) > 1:
+            #print("Found multiple IPs for the same domain")
+            # Group hosts by fingerprint signature
+            signature_to_hosts = check_fingerptints(results)
+
+            # Map ip_field -> port (from service entries)
+            host_port = {}
+            for h in results["host"]:
+                if isinstance(h, dict):
+                    ip_field = h.get("ip", "Unknown")
+                    port = h.get("port", "Unknown")
+                    host_port[ip_field] = port
+
+            # If more than 1 signature, hosts differ in cert chain
+            if len(signature_to_hosts) > 1:
+                print("[WARN] Different fingerprint sets detected across hosts; printing issues per fingerprint-group.")
+
+            # Helper: filter findings by a set of host ip_fields
+            def _filter_by_hosts(items, host_set):
+                return [it for it in items if isinstance(it, dict) and it.get("ip") in host_set]
+
+            # Print issues ONCE per fingerprint-group
+            for signature, hosts_in_group in signature_to_hosts.items():
+                host_set = set(hosts_in_group)
+
+                # Header: applies to all hosts in this group
+                print("## Applies to hosts:",
+                      ", ".join(f"{ip}:{host_port.get(ip, 'Unknown')}" for ip in hosts_in_group))
+
+                # Filter each issue list to this host group
+                outdated_protocols = _filter_by_hosts(results["outdated_protocols"], host_set)
+                vulnerability = _filter_by_hosts(results["vulnerability"], host_set)
+                outdated_ciphers = _filter_by_hosts(results["outdated_ciphers"], host_set)
+                wildcard = _filter_by_hosts(results["wildcard"], host_set)
+                chain = _filter_by_hosts(results["chain_of_trust"], host_set)
+                days = _filter_by_hosts(results["days"], host_set)
+
+            if len(outdated_protocols) > 0:
+                protos = _unique_keep_order([item.get("id", "Unknown") for item in outdated_protocols])
+                print("Protocols Outdated:", ", ".join(protos))
+
+            if len(vulnerability) > 0:
+                vulns = _unique_keep_order([item.get("id", "Unknown") for item in vulnerability])
+                print("Detected Vulnerabilities:", ", ".join(vulns))
+
+            if len(outdated_ciphers) > 0:
+                ciphers = _unique_keep_order([
+                    (item.get("finding", "").split() or [""])[-1]
+                    for item in outdated_ciphers
+                ])
+                print("Outdated Ciphers detected:", ", ".join(ciphers))
+
+            if len(wildcard) > 0:
+                wilds = _unique_keep_order([item.get("finding", "Unknown") for item in wildcard])
+                print("Wildcard detected:", ", ".join(wilds))
+
+            if len(chain) > 0:
+                chains = _unique_keep_order([item.get("finding", "Unknown") for item in chain])
+                print("Detected chain not trusted:", ", ".join(chains))
+
+            if len(days) > 0:
+                ds = _unique_keep_order([item.get("finding", "Unknown") for item in days])
+                print("Days remaining:", ", ".join(ds))
+
+
+                print("----------")
+
+            return  # IMPORTANT: end here for multi-host case
+
+        # --- SINGLE HOST CASE (unchanged) ---
+        print("## Host:", ", ".join(
+            f'{item.get("ip", "Unknown")}:{item.get("port", "Unknown")}' for item in results["host"]
+        ))
+
+        if len(results["outdated_protocols"]) > 0:
+            print("Protocols Outdated:", ", ".join(item.get("id", "Unknown") for item in results["outdated_protocols"]))
+
+        if len(results["vulnerability"]) > 0:
+            print("Detected Vulnerabilities:", ", ".join(item.get("id", "Unknown") for item in results["vulnerability"]))
+
+        if len(results["outdated_ciphers"]) > 0:
+            print("Outdated Ciphers detected:", ", ".join(
+                (item.get("finding", "").split() or [""])[-1] for item in results["outdated_ciphers"]
+            ))
+
+        if len(results["wildcard"]) > 0:
+            print("Wildcard detected:", ", ".join(item.get("finding", "Unknown") for item in results["wildcard"]))
+
+        if len(results["chain_of_trust"]) > 0:
+            print("Detected chain not trusted:", ", ".join(item.get("finding", "Unknown") for item in results["chain_of_trust"]))
+
+        if len(results["days"]) > 0:
+            print("Days remaining:", ", ".join(item.get("finding", "Unknown") for item in results["days"]))
+
+        print("----------")
+
+
+def summarize_host(findings: List[dict]) -> None:
     """
-    Attempt to grab Common Name and wildcard.
-    This is heuristic; testssl's JSON wording can vary.
+    Print a simple summary of each finding.
+    Expects a list of dicts with keys: id, finding, severity.
     """
-    # Try CN=... pattern
-    m = re.search(r"\bCN\s*=\s*([^\s,;/]+)", finding, flags=re.IGNORECASE)
-    if m:
-        cn = m.group(1).strip()
-        return (cn, cn.startswith("*."))
-    # Try "Common Name" style
-    m = re.search(r"Common Name.*?:\s*([^\s,;/]+)", finding, flags=re.IGNORECASE)
-    if m:
-        cn = m.group(1).strip()
-        return (cn, cn.startswith("*."))
-    return (None, None)
+    results = initialise_sructure()
 
-def extract_rdns(finding: str) -> Optional[str]:
-    # Look for reverse DNS / PTR mentions
-    m = re.search(r"\br?dns\b[:=]\s*([A-Za-z0-9\.\-\_]+)", finding, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"\bPTR\b.*?:\s*([A-Za-z0-9\.\-\_]+)", finding, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"reverse lookup.*?:\s*([A-Za-z0-9\.\-\_]+)", finding, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
+    if not findings:
+        print("  No findings.")
+        return
 
-def extract_validity_days(finding: str) -> Optional[int]:
-    # Look for "... 45 days ..." etc.
-    m = RE_DAYS.search(finding)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    return None
-
-def chain_not_ok(finding: str) -> Optional[str]:
-    t = finding.lower()
-    keywords = [
-        "self-signed", "self signed", "untrusted", "not trusted", "unknown ca",
-        "missing intermediate", "incomplete chain", "chain issues", "broken chain"
-    ]
-    for k in keywords:
-        if k in t:
-            return k
-    return None
-
-def is_cbc_cipher(finding_or_id: str) -> bool:
-    return "CBC" in finding_or_id.upper()
-
-def is_rc4(finding_or_id: str) -> bool:
-    return "RC4" in finding_or_id.upper()
-
-def is_3des(finding_or_id: str) -> bool:
-    up = finding_or_id.upper()
-    return "3DES" in up or "DES-CBC3" in up or "TLS_RSA_WITH_3DES_EDE_CBC_SHA" in up
-
-def is_weak_dh(finding: str) -> bool:
-    t = finding.lower()
-    return ("dh" in t and ("weak" in t or "bits" in t and any(x in t for x in ["512", "768", "1024"])))
-
-def is_vulnerable_entry(vuln_id: str, finding: str, severity: str) -> bool:
-    # Consider not OK if severity is not OK/INFO, or if finding explicitly says "vulnerable"
-    t = finding.lower()
-    if "not vulnerable" in t or "no vulnerability" in t:
-        return False
-    # Many testssl vulns mark vulnerable with 'VULNERABLE' or 'VULNERABLE (something)'
-    if "vulnerable" in t:
-        return True
-    # Fallback: if severity is HIGH/CRITICAL/MEDIUM/LOW for a known vuln ID
-    sev = severity.upper()
-    if vuln_id and any(v in vuln_id.upper() for v in VULN_IDS) and sev in {"LOW", "MEDIUM", "HIGH", "CRITICAL", "WARN"}:
-        return True
-    return False
-
-# ---------------- Aggregation ----------------
-class HostAgg:
-    def __init__(self):
-        self.domain: Optional[str] = None
-        self.ip: Optional[str] = None
-        self.port: Optional[str] = None
-        self.rdns: Optional[str] = None
-
-        # Problems
-        self.bad_protocols: List[str] = []          # e.g., ["TLS1.0 offered", "TLS1.1 offered"]
-        self.bad_ciphers: List[str] = []            # e.g., ["RC4 offered", "3DES offered (SWEET32)", "CBC offered", "weak DH params"]
-        self.cert_issues: List[str] = []            # e.g., ["validity 45 days", "chain of trust = NOT OK (self-signed)"]
-        self.vulns: List[str] = []                  # e.g., ["SWEET32 vulnerable"]
-
-        # Hint fields
-        self.cn: Optional[str] = None
-        self.wildcard: Optional[bool] = None
-        self.min_validity_days: Optional[int] = None
-        self.chain_detail: Optional[str] = None
-
-    def any_problem(self) -> bool:
-        return any([self.bad_protocols, self.bad_ciphers, self.cert_issues, self.vulns])
-
-def summarize_host(findings: List[dict], validity_threshold: int) -> HostAgg:
-    agg = HostAgg()
-
-    # Track cipher weakness booleans so we don't duplicate
-    has_rc4 = has_3des = has_cbc = has_weakdh = False
-    offered_tls10 = offered_tls11 = False
-    chain_issue_key: Optional[str] = None
-    min_days: Optional[int] = None
-
-    # Heuristic scan
     for f in findings:
+        if not isinstance(f, dict):
+            print(f"  Warning: finding entry is not a dict: {type(f).__name__}")
+            continue
         id_ = str(f.get("id", "") or "")
         finding = str(f.get("finding", "") or "")
         severity = str(f.get("severity", "") or "")
+        results = extract_information(id_, f, results)
 
-        # Host meta
-        if agg.port is None and f.get("port"):
-            agg.port = str(f["port"])
-        if agg.domain is None or agg.ip is None:
-            d, ip = parse_ip_and_domain(str(f.get("ip", "") or ""))
-            agg.domain = agg.domain or d
-            agg.ip = agg.ip or ip
+    check_issues(results)
 
-        # rdns
-        if agg.rdns is None:
-            rd = extract_rdns(finding)
-            if rd:
-                agg.rdns = rd
+def extract_findings(data: Union[Dict, List]) -> Tuple[Optional[Dict], List[dict]]:
+    """
+    Normalize parsed JSON into (header, findings_list).
+    - If data is a dict and contains 'findings', use that.
+    - If data is a dict without 'findings' but looks like a list under another key, try to detect.
+    - If data is a list, assume it's the findings list.
+    """
+    header = None
+    findings: List[dict] = []
 
-        # Protocols: flag TLS1.0/1.1 if "offered"
-        if id_.upper() in {"TLS1", "TLS1_1"}:
-            if looks_offered(finding):
-                if id_.upper() == "TLS1":
-                    offered_tls10 = True
-                else:
-                    offered_tls11 = True
-
-        # Ciphers: weak families
-        id_plus = f"{id_} {finding}"
-        if not has_rc4 and is_rc4(id_plus) and looks_offered(finding):
-            has_rc4 = True
-        if not has_3des and is_3des(id_plus) and looks_offered(finding):
-            has_3des = True
-        if not has_cbc and is_cbc_cipher(id_plus) and looks_offered(finding):
-            has_cbc = True
-        if not has_weakdh and is_weak_dh(finding):
-            has_weakdh = True
-
-        # Certificate hints: CN / wildcard
-        if agg.cn is None or agg.wildcard is None:
-            cn, wc = extract_cn_and_wildcard(finding)
-            if cn:
-                agg.cn = cn
-                agg.wildcard = wc
-
-        # Certificate validity (min days encountered)
-        days = extract_validity_days(finding)
-        if days is not None:
-            if min_days is None or days < min_days:
-                min_days = days
-
-        # Chain of trust problems
-        bad = chain_not_ok(finding)
-        if bad and chain_issue_key is None:
-            chain_issue_key = bad
-
-        # Vulnerabilities
-        if any(v in id_.upper() for v in VULN_IDS) or any(v in finding.upper() for v in VULN_IDS):
-            # Use the ID as the vuln label
-            label = next((v for v in VULN_IDS if v in id_.upper() or v in finding.upper()), None)
-            if label and is_vulnerable_entry(label, finding, severity):
-                if label not in agg.vulns:
-                    agg.vulns.append(label)
-
-    # Finalize protocol issues (RFC 8996 deprecation)
-    if offered_tls10:
-        agg.bad_protocols.append("TLS1.0 offered")
-    if offered_tls11:
-        agg.bad_protocols.append("TLS1.1 offered")
-
-    # Finalize cipher issues
-    if has_rc4:
-        agg.bad_ciphers.append("RC4 offered")
-    if has_3des:
-        agg.bad_ciphers.append("3DES offered (SWEET32)")
-    if has_cbc:
-        agg.bad_ciphers.append("CBC offered")
-    if has_weakdh:
-        agg.bad_ciphers.append("weak DH params")
-
-    # Finalize certificate issues
-    if min_days is not None:
-        agg.min_validity_days = min_days
-        if min_days < validity_threshold:
-            agg.cert_issues.append(f"validity {min_days} days")
-    if chain_issue_key:
-        agg.chain_detail = chain_issue_key
-        agg.cert_issues.append(f"chain of trust = NOT OK ({chain_issue_key})")
-
-    return agg
-
-def load_json_file(path: str) -> List[dict]:
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    # Some users might concatenate arrays; tolerate dicts (unlikely) by normalizing
     if isinstance(data, dict):
-        # Try common key names; otherwise wrap
-        items = data.get("scanResult") or data.get("findings") or []
-        if isinstance(items, list):
-            return items
-        return [data]
+        header = get_header_file(data)
+        if "findings" in data and isinstance(data["findings"], list):
+            findings = data["findings"]
+        else:
+            # Try to infer: maybe the dict only contains one list value that's the findings
+            list_like_keys = [k for k, v in data.items() if isinstance(v, list)]
+            if len(list_like_keys) == 1:
+                findings = data[list_like_keys[0]]
+            else:
+                print("  Warning: Could not locate a 'findings' list in dict JSON.")
     elif isinstance(data, list):
-        return data
+        # Root is a list: treat as findings list
+        findings = data
     else:
-        return []
+        print(f"  Warning: Unexpected JSON root type: {type(data).__name__}")
 
-def main():
-    ap = argparse.ArgumentParser(description="Print problems-only summary from testssl JSON folder.")
-    ap.add_argument("folder", help="Folder containing one or more testssl JSON files")
-    ap.add_argument("--validity-threshold", type=int, default=60, help="Warn if certificate validity is below this many days (default: 60)")
-    ap.add_argument("--no-color", action="store_true", help="Disable ANSI colours")
-    ap.add_argument("--glob", default="*.json", help="Filename glob to include (default: *.json)")
-    args = ap.parse_args()
+    return header, findings
 
-    use_color = not args.no_color
 
-    # Collect findings per host (key = (domain, ip, port))
-    per_host: Dict[Tuple[Optional[str], Optional[str], Optional[str]], List[dict]] = defaultdict(list)
-    file_dates: Dict[Tuple[Optional[str], Optional[str], Optional[str]], datetime] = {}
-
-    import glob
-    pattern = os.path.join(args.folder, args.glob)
+def read_json_files(folder_path: str) -> None:
+    # Pattern to match all JSON files in the folder (non-recursive)
+    pattern = os.path.join(folder_path, "*.json")
     files = sorted(glob.glob(pattern))
+
     if not files:
         print("No JSON files found.")
-        sys.exit(1)
+        return
 
-    for fp in files:
+    for file_path in files:
+        #print(f"\n--- File: {file_path} ---")
         try:
-            findings = load_json_file(fp)
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            header, findings = extract_findings(data)
+            if header:
+                print("Header:", header)
+
+            if not isinstance(findings, list):
+                print("  Warning: findings is not a list; skipping.")
+                continue
+
+            summarize_host(findings)
+
+        except json.JSONDecodeError:
+            print(f"Error: {file_path} is not a valid JSON file.")
         except Exception as e:
-            print(colorize(use_color, f"[!] Failed to parse {fp}: {e}", Ansi.RED), file=sys.stderr)
-            continue
-        # Determine file time as scan date fallback
-        dt = datetime.fromtimestamp(os.path.getmtime(fp), tz=timezone.utc)
+            print(f"Error reading {file_path}: {e}")
 
-        # Group by host tuple
-        # We may see multiple hosts in one file; collect first pass,
-        # then we’ll repartition by the values encountered.
-        temp_groups: Dict[Tuple[Optional[str], Optional[str], Optional[str]], List[dict]] = defaultdict(list)
-        for f in findings:
-            d, ip = parse_ip_and_domain(str(f.get("ip", "") or ""))
-            port = str(f.get("port", "") or "") or None
-            key = (d, ip, port)
-            temp_groups[key].append(f)
 
-        for key, lst in temp_groups.items():
-            per_host[key].extend(lst)
-            # Keep the newest date across files for the same key
-            if key not in file_dates or dt > file_dates[key]:
-                file_dates[key] = dt
+def main() -> None:
+    folder = "results"  # Replace with your folder path
+    read_json_files(folder)
 
-    # Print problems-only view
-    for (domain, ip, port), lst in sorted(per_host.items(), key=lambda kv: (kv[0][1] or "", kv[0][0] or "", kv[0][2] or "")):
-        agg = summarize_host(lst, args.validity_threshold)
-        if not agg.any_problem():
-            continue
-
-        # Header
-        dt = file_dates.get((domain, ip, port)) or datetime.now(tz=timezone.utc)
-        datestr = dt.strftime("%Y-%m-%d")
-        ip_s = ip or "-"
-        domain_s = domain or "-"
-        rdns_s = agg.rdns or "-"
-        port_s = port or "-"
-        header = f"{datestr}  {ip_s}  {domain_s}  rdns={rdns_s} :{port_s}"
-        print(colorize(use_color, header, Ansi.CYAN))
-
-        # NOT OK sections
-        print(colorize(use_color, "NOT OK:", Ansi.BOLD))
-
-        if agg.bad_protocols:
-            proto_line = ", ".join(sorted(set(agg.bad_protocols), key=str.lower))
-            # Emphasize deprecated status
-            proto_line += "   [deprecated]"
-            print(f"- Protocols: {colorize(use_color, proto_line, Ansi.RED)}")
-
-        if agg.bad_ciphers:
-            cipher_line = ", ".join(sorted(set(agg.bad_ciphers), key=str.lower))
-            print(f"- Ciphers: {colorize(use_color, cipher_line, Ansi.RED)}")
-
-        if agg.cert_issues:
-            cert_line = ", ".join(agg.cert_issues)
-            # Append CN/wildcard context if known
-            ctx = []
-            if agg.cn:
-                ctx.append(f"CN={agg.cn}")
-            if agg.wildcard is not None:
-                ctx.append(f"wildcard={'Yes' if agg.wildcard else 'No'}")
-            if ctx:
-                cert_line += " [" + ", ".join(ctx) + "]"
-            print(f"- Certificate: {colorize(use_color, cert_line, Ansi.YELLOW)}")
-
-        if agg.vulns:
-            vuln_line = ", ".join(sorted(set(agg.vulns), key=str.lower))
-            print(f"- Vulnerabilities: {colorize(use_color, vuln_line, Ansi.RED)}")
-
-        print(colorize(use_color, "-"*60, Ansi.DIM))
 
 if __name__ == "__main__":
     main()

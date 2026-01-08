@@ -1,0 +1,23 @@
+[
+         {
+              "id"           : "engine_problem",
+              "ip"           : "kpmg.co.uk/",
+              "port"         : "443",
+              "severity"     : "WARN",
+              "finding"      : "No engine or GOST support via engine with your /usr/bin/openssl"
+          }
+,         {
+              "id"           : "scanProblem",
+              "ip"           : "kpmg.co.uk/",
+              "port"         : "443",
+              "severity"     : "FATAL",
+              "finding"      : "No IPv4/IPv6 address(es) for 'kpmg.co.uk' available"
+          }
+,         {
+              "id"           : "scanTime",
+              "ip"           : "kpmg.co.uk/",
+              "port"         : "443",
+              "severity"     : "WARN",
+              "finding"      : "Scan interrupted"
+          }
+]
